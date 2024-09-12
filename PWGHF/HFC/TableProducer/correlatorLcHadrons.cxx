@@ -189,10 +189,14 @@ struct HfCorrelatorLcHadrons {
   ConfigurableAxis binsMultiplicity{"binsMultiplicity", {VARIABLE_WIDTH, 0.0f, 2000.0f, 6000.0f, 100000.0f}, "Mixing bins - multiplicity"};
   ConfigurableAxis binsZVtx{"binsZVtx", {VARIABLE_WIDTH, -10.0f, -2.5f, 2.5f, 10.0f}, "Mixing bins - z-vertex"};
   ConfigurableAxis binsMultiplicityMc{"binsMultiplicityMc", {VARIABLE_WIDTH, 0.0f, 20.0f, 50.0f, 500.0f}, "Mixing bins - MC multiplicity"}; // In MCGen multiplicity is defined by counting tracks
+  Configurable<bool> storeAutoCorrelationFlag{"storeAutoCorrelationFlag", false, "Store flag that indicates if the track is paired to its D-meson mother instead of skipping it"};
+  Configurable<bool> correlateD0WithLeadingParticle{"correlateD0WithLeadingParticle", false, "Switch for correlation of D0 mesons with leading particle only"};
 
   HfHelper hfHelper;
   SliceCache cache;
   BinningType corrBinning{{binsZVtx, binsMultiplicity}, true};
+  int leadingIndex = 0;
+  bool correlationStatus = false;
 
   // Filters for ME
   Filter collisionFilter = aod::hf_selection_lc_collision::lcSel >= filterFlagLc;
@@ -253,6 +257,23 @@ struct HfCorrelatorLcHadrons {
     registry.add("hCountLctriggersMcGen", "Lc trigger particles - Mc gen;;N of trigger Lc", {HistType::kTH2F, {{1, -0.5, 0.5}, {vbins, "#it{p}_{T} (GeV/#it{c})"}}});
     corrBinning = {{binsZVtx, binsMultiplicity}, true};
   }
+  
+  // Find Leading Particle
+  template <typename TTracks>
+  int findLeadingParticle(TTracks const& tracks)
+  {
+    auto leadingParticle = tracks.begin();
+    for (auto const& track : tracks) {
+      if (std::abs(track.dcaXY()) >= 1. || std::abs(track.dcaZ()) >= 1.) {
+        continue;
+      }
+      if (track.pt() > leadingParticle.pt()) {
+        leadingParticle = track;
+      }
+    }
+    int leadingIndex = leadingParticle.globalIndex();
+    return leadingIndex;
+  }
 
   /// Lc-h correlation pair builder - for real data and data-like analysis (i.e. reco-level w/o matching request via Mc truth)
   void processData(soa::Join<aod::Collisions, aod::Mults>::iterator const& collision,
@@ -263,6 +284,12 @@ struct HfCorrelatorLcHadrons {
     if (selectedLcCandidates.size() == 0) {
       return;
     }
+
+    // find leading particle
+    if (correlateD0WithLeadingParticle) {
+      leadingIndex = findLeadingParticle(tracks);
+    }
+
     int poolBin = corrBinning.getBin(std::make_tuple(collision.posZ(), collision.multFT0M()));
     int nTracks = 0;
     if (collision.numContrib() > 1) {
@@ -335,16 +362,29 @@ struct HfCorrelatorLcHadrons {
         if (std::abs(track.dcaXY()) >= dcaXYTrackMax || std::abs(track.dcaZ()) >= dcaZTrackMax) {
           continue; // Remove secondary tracks
         }
+
         // Remove Lc daughters by checking track indices
         if ((candidate.prong0Id() == track.globalIndex()) || (candidate.prong1Id() == track.globalIndex()) || (candidate.prong2Id() == track.globalIndex())) {
-          continue;
+          if (!storeAutoCorrelationFlag) {
+            continue;
+          }
+          correlationStatus = true;
         }
+
+        if (correlateD0WithLeadingParticle) {
+          if (track.globalIndex() != leadingIndex) {
+            continue;
+          }
+          registry.fill(HIST("hTrackCounter"), 4); // fill no. of tracks  have leading particle
+        }
+
         if (candidate.isSelLcToPKPi() >= selectionFlagLc) {
           entryLcHadronPair(getDeltaPhi(track.phi(), candidate.phi()),
                             track.eta() - candidate.eta(),
                             candidate.pt(),
                             track.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPKPi(candidate), false);
         }
         if (candidate.isSelLcToPiKP() >= selectionFlagLc) {
@@ -352,7 +392,8 @@ struct HfCorrelatorLcHadrons {
                             track.eta() - candidate.eta(),
                             candidate.pt(),
                             track.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPiKP(candidate), false);
         }
       } // Hadron Tracks loop
@@ -475,13 +516,14 @@ struct HfCorrelatorLcHadrons {
           continue;
         }
         registry.fill(HIST("hPtParticleAssocMcRec"), track.pt());
-
+        
         if (candidate.isSelLcToPKPi() >= selectionFlagLc) {
           entryLcHadronPair(getDeltaPhi(track.phi(), candidate.phi()),
                             track.eta() - candidate.eta(),
                             candidate.pt(),
                             track.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPKPi(candidate), isLcSignal);
         }
         if (candidate.isSelLcToPiKP() >= selectionFlagLc) {
@@ -489,7 +531,8 @@ struct HfCorrelatorLcHadrons {
                             track.eta() - candidate.eta(),
                             candidate.pt(),
                             track.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPiKP(candidate), isLcSignal);
         }
       } // end inner loop (Tracks)
@@ -564,7 +607,8 @@ struct HfCorrelatorLcHadrons {
                             particleAssoc.eta() - particle.eta(),
                             particle.pt(),
                             particleAssoc.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(MassLambdaCPlus, true);
         } // end inner loop
       }
@@ -600,7 +644,8 @@ struct HfCorrelatorLcHadrons {
                             t1.eta() - t2.eta(),
                             t1.pt(),
                             t2.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPKPi(t1), false);
         }
         if (t1.isSelLcToPiKP() >= selectionFlagLc) {
@@ -608,7 +653,8 @@ struct HfCorrelatorLcHadrons {
                             t1.eta() - t2.eta(),
                             t1.pt(),
                             t2.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPiKP(t1), false);
         }
       }
@@ -634,7 +680,8 @@ struct HfCorrelatorLcHadrons {
                             t1.eta() - t2.eta(),
                             t1.pt(),
                             t2.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPKPi(t1), false);
         }
         if (t1.isSelLcToPiKP() >= selectionFlagLc) {
@@ -642,7 +689,8 @@ struct HfCorrelatorLcHadrons {
                             t1.eta() - t2.eta(),
                             t1.pt(),
                             t2.pt(),
-                            poolBin);
+                            poolBin,
+                            correlationStatus);
           entryLcHadronRecoInfo(hfHelper.invMassLcToPiKP(t1), false);
         }
       }
@@ -696,7 +744,8 @@ struct HfCorrelatorLcHadrons {
                           t1.eta() - t2.eta(),
                           t1.pt(),
                           t2.pt(),
-                          poolBin);
+                          poolBin,
+                          correlationStatus);
       }
     }
   }
